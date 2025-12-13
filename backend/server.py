@@ -204,9 +204,11 @@ class BackgroundTasks:
                 await db.telemetry_data.insert_one(doc)
                 
                 # Broadcast via WebSocket
+                telemetry_dict = telemetry.model_dump()
+                telemetry_dict['timestamp'] = telemetry_dict['timestamp'].isoformat()
                 await manager.broadcast({
                     "type": "telemetry",
-                    "data": json.loads(telemetry.model_dump_json(mode='json'))
+                    "data": telemetry_dict
                 })
                 
                 await asyncio.sleep(frequency)
@@ -261,9 +263,11 @@ class BackgroundTasks:
                         await db.system_alerts.insert_one(alert_doc)
                         
                         # Broadcast alert
+                        alert_dict = alert.model_dump()
+                        alert_dict['timestamp'] = alert_dict['timestamp'].isoformat()
                         await manager.broadcast({
                             "type": "alert",
-                            "data": json.loads(alert.model_dump_json(mode='json'))
+                            "data": alert_dict
                         })
                 
                 await asyncio.sleep(10)
@@ -445,9 +449,11 @@ async def create_mission_phase(mission_input: MissionPhaseCreate):
     await db.mission_phases.insert_one(doc)
     
     # Broadcast mission change
+    mission_dict = mission.model_dump()
+    mission_dict['started_at'] = mission_dict['started_at'].isoformat()
     await manager.broadcast({
         "type": "mission_change",
-        "data": json.loads(mission.model_dump_json(mode='json'))
+        "data": mission_dict
     })
     
     return mission
