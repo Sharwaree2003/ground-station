@@ -48,7 +48,7 @@ const MonitoringAlerts = () => {
   const fetchData = async () => {
     try {
       const [alertsRes, serversRes] = await Promise.all([
-        fetch(`${API}/alerts?limit=50&acknowledged=${showAcknowledged}`);
+        fetch(`${API}/alerts?limit=50&acknowledged=${showAcknowledged}`),
         fetch(`${API}/servers`)
       ]);
       
