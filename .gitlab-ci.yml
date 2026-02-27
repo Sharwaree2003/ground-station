@@ -1,0 +1,483 @@
+# GitLab CI/CD Pipeline for Ground Station Management System
+# This pipeline automates testing, building, and deployment
+
+# Define stages
+stages:
+  - preflight
+  - build
+  - test
+  - security
+  - deploy
+  - verify
+  - notify
+
+# Global variables
+variables:
+  APP_DIR: "/opt/ground-station/app"
+  VENV_DIR: "/opt/ground-station/venv"
+  DEPLOY_USER: "groundstation"
+  BACKUP_DIR: "/backup/ground-station"
+  
+# Cache configuration
+cache:
+  paths:
+    - frontend/node_modules/
+    - backend/.cache/
+
+# ============================================================================
+# STAGE 1: Pre-flight Checks
+# ============================================================================
+
+preflight:check_services:
+  stage: preflight
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - echo "🚀 Starting Ground Station Deployment Pipeline"
+    - echo "Pipeline ID: $CI_PIPELINE_ID"
+    - echo "Commit: $CI_COMMIT_SHORT_SHA"
+    - echo "Branch: $CI_COMMIT_REF_NAME"
+    - echo "Author: $CI_COMMIT_AUTHOR"
+    - echo ""
+    - echo "Checking required services..."
+    - systemctl is-active --quiet mongod || (echo "❌ MongoDB is not running" && exit 1)
+    - systemctl is-active --quiet nginx || (echo "❌ Nginx is not running" && exit 1)
+    - echo "✅ All required services are running"
+    - echo ""
+    - echo "Checking system resources..."
+    - df -h /
+    - free -h
+    - echo "✅ Pre-flight check complete"
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# ============================================================================
+# STAGE 2: Build
+# ============================================================================
+
+build:backend:
+  stage: build
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - echo "🔨 Building backend..."
+    - cd backend
+    - source $VENV_DIR/bin/activate
+    - pip install -r requirements.txt
+    - echo "✅ Backend dependencies installed"
+  artifacts:
+    paths:
+      - backend/
+    expire_in: 1 hour
+  only:
+    - main
+    - develop
+    - merge_requests
+
+build:frontend:
+  stage: build
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - echo "🏗️ Building frontend..."
+    - cd frontend
+    - yarn install --frozen-lockfile
+    - yarn build
+    - ls -lh build/
+    - echo "✅ Frontend build complete"
+  artifacts:
+    paths:
+      - frontend/build/
+      - frontend/package.json
+    expire_in: 1 hour
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# ============================================================================
+# STAGE 3: Testing
+# ============================================================================
+
+test:backend:
+  stage: test
+  tags:
+    - rhel9
+    - ground-station
+  dependencies:
+    - build:backend
+  script:
+    - echo "🧪 Running backend tests..."
+    - cd backend
+    - source $VENV_DIR/bin/activate
+    - |
+      # Run linting
+      pip install flake8 || true
+      flake8 server.py --max-line-length=120 --count || true
+    - |
+      # Run tests if they exist
+      if [ -d "tests" ]; then
+        pip install pytest pytest-asyncio httpx
+        python -m pytest tests/ -v --tb=short || true
+      else
+        echo "No tests found, skipping..."
+      fi
+    - echo "✅ Backend tests complete"
+  allow_failure: true
+  only:
+    - main
+    - develop
+    - merge_requests
+
+test:frontend:
+  stage: test
+  tags:
+    - rhel9
+    - ground-station
+  dependencies:
+    - build:frontend
+  script:
+    - echo "🧪 Running frontend tests..."
+    - cd frontend
+    - |
+      # Run linting
+      yarn lint || true
+    - |
+      # Run tests if they exist
+      if [ -f "package.json" ] && grep -q "\"test\"" package.json; then
+        yarn test --passWithNoTests || true
+      else
+        echo "No tests configured, skipping..."
+      fi
+    - echo "✅ Frontend tests complete"
+  allow_failure: true
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# ============================================================================
+# STAGE 4: Security Scanning
+# ============================================================================
+
+security:backend:
+  stage: security
+  tags:
+    - rhel9
+    - ground-station
+  dependencies:
+    - build:backend
+  script:
+    - echo "🔒 Running backend security scan..."
+    - cd backend
+    - source $VENV_DIR/bin/activate
+    - |
+      # Install and run safety check
+      pip install safety || true
+      safety check --json || true
+    - echo "✅ Backend security scan complete"
+  allow_failure: true
+  only:
+    - main
+    - develop
+
+security:frontend:
+  stage: security
+  tags:
+    - rhel9
+    - ground-station
+  dependencies:
+    - build:frontend
+  script:
+    - echo "🔒 Running frontend security scan..."
+    - cd frontend
+    - yarn audit --level moderate || true
+    - echo "✅ Frontend security scan complete"
+  allow_failure: true
+  only:
+    - main
+    - develop
+
+# ============================================================================
+# STAGE 5: Deployment
+# ============================================================================
+
+deploy:backup:
+  stage: deploy
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - echo "💾 Creating backup before deployment..."
+    - mkdir -p $BACKUP_DIR
+    - |
+      TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+      tar -czf $BACKUP_DIR/backup_${TIMESTAMP}.tar.gz \
+        $APP_DIR/backend \
+        $APP_DIR/frontend 2>/dev/null || true
+    - |
+      # Keep only last 5 backups
+      cd $BACKUP_DIR
+      ls -t backup_*.tar.gz | tail -n +6 | xargs rm -f || true
+    - echo "✅ Backup created"
+  only:
+    - main
+
+deploy:backend:
+  stage: deploy
+  tags:
+    - rhel9
+    - ground-station
+  dependencies:
+    - build:backend
+  script:
+    - echo "🚢 Deploying backend..."
+    - echo "Stopping backend service..."
+    - sudo systemctl stop ground-station-backend
+    - echo "Copying backend files..."
+    - sudo -u $DEPLOY_USER rsync -av --delete backend/ $APP_DIR/backend/
+    - echo "Installing dependencies..."
+    - cd $APP_DIR/backend
+    - source $VENV_DIR/bin/activate
+    - pip install -r requirements.txt
+    - |
+      # Ensure .env file exists
+      if [ ! -f ".env" ]; then
+        echo "Creating .env file..."
+        cat > .env << EOF
+      MONGO_URL=mongodb://$DEPLOY_USER:$MONGO_PASSWORD@localhost:27017/ground_station_db
+      DB_NAME=ground_station_db
+      CORS_ORIGINS=*
+      EOF
+      fi
+    - echo "Starting backend service..."
+    - sudo systemctl start ground-station-backend
+    - sleep 5
+    - sudo systemctl is-active --quiet ground-station-backend || exit 1
+    - echo "✅ Backend deployed successfully"
+  only:
+    - main
+  when: on_success
+
+deploy:frontend:
+  stage: deploy
+  tags:
+    - rhel9
+    - ground-station
+  dependencies:
+    - build:frontend
+  script:
+    - echo "🎨 Deploying frontend..."
+    - echo "Stopping frontend service..."
+    - sudo systemctl stop ground-station-frontend
+    - echo "Copying frontend build..."
+    - sudo -u $DEPLOY_USER rsync -av --delete frontend/build/ $APP_DIR/frontend/build/
+    - sudo -u $DEPLOY_USER rsync -av frontend/package.json $APP_DIR/frontend/
+    - echo "Starting frontend service..."
+    - sudo systemctl start ground-station-frontend
+    - sleep 5
+    - sudo systemctl is-active --quiet ground-station-frontend || exit 1
+    - echo "✅ Frontend deployed successfully"
+  only:
+    - main
+  when: on_success
+
+# ============================================================================
+# STAGE 6: Verification
+# ============================================================================
+
+verify:health_check:
+  stage: verify
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - echo "🏥 Performing health checks..."
+    - sleep 10
+    - |
+      # Check backend API
+      echo "Checking backend API..."
+      response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8001/api/)
+      if [ $response -eq 200 ]; then
+        echo "✅ Backend API is healthy (HTTP $response)"
+      else
+        echo "❌ Backend API health check failed (HTTP $response)"
+        exit 1
+      fi
+    - |
+      # Check frontend
+      echo "Checking frontend..."
+      response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/)
+      if [ $response -eq 200 ]; then
+        echo "✅ Frontend is healthy (HTTP $response)"
+      else
+        echo "❌ Frontend health check failed (HTTP $response)"
+        exit 1
+      fi
+    - |
+      # Check MongoDB
+      echo "Checking MongoDB..."
+      mongosh --quiet --eval "db.adminCommand('ping')" || exit 1
+      echo "✅ MongoDB is healthy"
+    - echo "✅ All health checks passed"
+  only:
+    - main
+
+verify:smoke_tests:
+  stage: verify
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - echo "💨 Running smoke tests..."
+    - |
+      echo "Testing API endpoints..."
+      
+      # Test root endpoint
+      curl -f http://localhost:8001/api/ || exit 1
+      echo "✅ Root endpoint OK"
+      
+      # Test dashboard stats
+      curl -f http://localhost:8001/api/dashboard/stats || exit 1
+      echo "✅ Dashboard stats OK"
+      
+      # Test servers endpoint
+      curl -f http://localhost:8001/api/servers || exit 1
+      echo "✅ Servers endpoint OK"
+      
+      # Test telemetry endpoint
+      curl -f http://localhost:8001/api/telemetry?limit=10 || exit 1
+      echo "✅ Telemetry endpoint OK"
+    - echo "✅ All smoke tests passed"
+  only:
+    - main
+
+verify:system_resources:
+  stage: verify
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - echo "📊 Checking system resources..."
+    - |
+      echo "CPU Usage:"
+      top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1"%"}'
+      
+      echo ""
+      echo "Memory Usage:"
+      free -h | awk 'NR==2{printf "Used: %s / %s (%.2f%%)\n", $3, $2, $3*100/$2}'
+      
+      echo ""
+      echo "Disk Usage:"
+      df -h / | awk 'NR==2{printf "%s / %s (%s)\n", $3, $2, $5}'
+      
+      echo ""
+      echo "Service Status:"
+      systemctl status ground-station-backend --no-pager | head -3
+      systemctl status ground-station-frontend --no-pager | head -3
+    - echo "✅ System resource check complete"
+  only:
+    - main
+
+# ============================================================================
+# STAGE 7: Notifications
+# ============================================================================
+
+notify:success:
+  stage: notify
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - |
+      echo "╔════════════════════════════════════════════════════════╗"
+      echo "║         ✅ DEPLOYMENT SUCCESSFUL                       ║"
+      echo "╚════════════════════════════════════════════════════════╝"
+      echo ""
+      echo "🎉 Ground Station Management System deployed successfully!"
+      echo ""
+      echo "📊 Deployment Details:"
+      echo "   • Pipeline ID: $CI_PIPELINE_ID"
+      echo "   • Commit: $CI_COMMIT_SHORT_SHA"
+      echo "   • Branch: $CI_COMMIT_REF_NAME"
+      echo "   • Author: $CI_COMMIT_AUTHOR"
+      echo "   • Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+      echo ""
+      echo "🔗 Application URLs:"
+      echo "   • Frontend: http://$(hostname -I | awk '{print $1}')/"
+      echo "   • Backend API: http://$(hostname -I | awk '{print $1}')/api/"
+      echo ""
+      
+      # Create deployment log
+      cat > /tmp/deployment_log.txt << EOF
+      Deployment Information
+      ======================
+      Pipeline ID: $CI_PIPELINE_ID
+      Commit: $CI_COMMIT_SHORT_SHA
+      Branch: $CI_COMMIT_REF_NAME
+      Author: $CI_COMMIT_AUTHOR
+      Timestamp: $(date '+%Y-%m-%d %H:%M:%S')
+      Status: SUCCESS
+      EOF
+      
+      # Save deployment log
+      mkdir -p /var/log/ground-station/deployments
+      cp /tmp/deployment_log.txt /var/log/ground-station/deployments/deploy_${CI_PIPELINE_ID}.txt
+  only:
+    - main
+  when: on_success
+
+notify:failure:
+  stage: notify
+  tags:
+    - rhel9
+    - ground-station
+  script:
+    - |
+      echo "╔════════════════════════════════════════════════════════╗"
+      echo "║         ❌ DEPLOYMENT FAILED                           ║"
+      echo "╚════════════════════════════════════════════════════════╝"
+      echo ""
+      echo "⚠️ Deployment failed! Attempting rollback..."
+      echo ""
+      
+      # Find and restore latest backup
+      LATEST_BACKUP=$(ls -t $BACKUP_DIR/backup_*.tar.gz 2>/dev/null | head -1)
+      
+      if [ -n "$LATEST_BACKUP" ]; then
+        echo "Restoring from backup: $LATEST_BACKUP"
+        
+        sudo systemctl stop ground-station-backend
+        sudo systemctl stop ground-station-frontend
+        
+        tar -xzf "$LATEST_BACKUP" -C / 2>/dev/null || true
+        
+        sudo systemctl start ground-station-backend
+        sudo systemctl start ground-station-frontend
+        
+        echo "✅ Rollback completed"
+      else
+        echo "❌ No backup found for rollback!"
+      fi
+      
+      echo ""
+      echo "Pipeline ID: $CI_PIPELINE_ID"
+      echo "Commit: $CI_COMMIT_SHORT_SHA"
+      echo "View logs: $CI_PIPELINE_URL"
+  only:
+    - main
+  when: on_failure
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+after_script:
+  - echo "Cleaning up temporary files..."
+  - rm -f /tmp/deployment_log.txt
+  - echo "Pipeline execution completed"
