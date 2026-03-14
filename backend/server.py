@@ -1,8 +1,11 @@
-from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 import os
 import logging
 import asyncio
@@ -35,7 +38,50 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ============= AUTHENTICATION =============
+
+# Security
+SECRET_KEY = os.environ.get("SECRET_KEY", "your-secret-key-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        return username
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+
 # ============= MODELS =============
+
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: Dict[str, Any]
 
 class ServerModel(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -331,6 +377,60 @@ class BackgroundTasks:
 background_tasks = BackgroundTasks()
 
 # ============= API ROUTES =============
+
+# Authentication Routes
+@api_router.post("/auth/login", response_model=Token)
+async def login(user_data: UserLogin):
+    """Login endpoint"""
+    # Check user in database
+    user = await db.users.find_one({"username": user_data.username})
+    
+    if not user or not verify_password(user_data.password, user["password"]):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    
+    # Create access token
+    access_token = create_access_token(data={"sub": user["username"]})
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "username": user["username"],
+            "email": user.get("email", ""),
+            "role": user.get("role", "operator")
+        }
+    }
+
+@api_router.post("/auth/register")
+async def register(user_data: UserLogin):
+    """Register new user"""
+    # Check if user exists
+    existing_user = await db.users.find_one({"username": user_data.username})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    # Create new user
+    hashed_password = get_password_hash(user_data.password)
+    new_user = {
+        "id": str(uuid.uuid4()),
+        "username": user_data.username,
+        "password": hashed_password,
+        "email": f"{user_data.username}@groundstation.local",
+        "role": "operator",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.users.insert_one(new_user)
+    
+    return {"message": "User registered successfully", "username": user_data.username}
+
+@api_router.get("/auth/me")
+async def get_current_user_info(current_user: str = Depends(get_current_user)):
+    """Get current user info"""
+    user = await db.users.find_one({"username": current_user}, {"_id": 0, "password": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
 
 @api_router.get("/")
 async def root():
