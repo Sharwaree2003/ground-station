@@ -720,6 +720,20 @@ async def initialize_system():
     await db.system_alerts.delete_many({})
     await db.ansible_playbooks.delete_many({})
     
+    # Create default admin user if not exists
+    admin_user = await db.users.find_one({"username": "admin"})
+    if not admin_user:
+        hashed_password = get_password_hash("admin123")
+        default_user = {
+            "id": str(uuid.uuid4()),
+            "username": "admin",
+            "password": hashed_password,
+            "email": "admin@groundstation.local",
+            "role": "admin",
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.users.insert_one(default_user)
+    
     # Create default servers
     servers = [
         ServerModel(
